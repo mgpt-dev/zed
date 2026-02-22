@@ -189,7 +189,12 @@ impl PlanningPanel {
                     if let Some(plan_id) = panel.active_plan_id {
                         if let Some(saved_plan) = panel.saved_plans.iter().find(|p| p.id == plan_id) {
                             // Parse and load the plan
-                            if let Some(plan) = parse_markdown_to_plan(&saved_plan.content) {
+                            if let Some(mut plan) = parse_markdown_to_plan(&saved_plan.content) {
+                                // IMPORTANT: Preserve the original plan ID from saved_plans
+                                // parse_markdown_to_plan generates a new ID, but we need to keep
+                                // the original so that save_current_plan can find the existing entry
+                                plan.id = plan_id;
+
                                 let plan_title = plan.metadata.title.clone();
                                 let event = PlanEvent::PlanCreated {
                                     plan,
