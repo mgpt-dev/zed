@@ -12412,6 +12412,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "planning"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
+name = "planning_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "db",
+ "editor",
+ "futures 0.3.31",
+ "gpui",
+ "language_model",
+ "log",
+ "planning",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
@@ -21335,6 +21371,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "picker",
+ "planning_panel",
  "pretty_assertions",
  "profiling",
  "project",
