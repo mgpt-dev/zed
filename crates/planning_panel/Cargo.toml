@@ -28,6 +28,13 @@ editor.workspace = true
 
 # Internal dependencies
 planning.workspace = true
+schemars.workspace = true
+agent_ui.workspace = true
+agent_settings.workspace = true
+agent.workspace = true
+project.workspace = true
+prompt_store.workspace = true
+fs.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

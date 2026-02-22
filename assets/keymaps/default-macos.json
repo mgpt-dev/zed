@@ -1067,6 +1067,13 @@
     },
   },
   {
+    "context": "PlanningPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "planning_panel::InlineAssist",
+    },
+  },
+  {
     "context": "DebugPanel",
     "bindings": {
       "cmd-t": "debugger::ToggleThreadPicker",

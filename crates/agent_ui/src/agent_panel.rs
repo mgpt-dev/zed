@@ -840,7 +840,7 @@ impl AgentPanel {
         }
     }
 
-    pub(crate) fn prompt_store(&self) -> &Option<Entity<PromptStore>> {
+    pub fn prompt_store(&self) -> &Option<Entity<PromptStore>> {
         &self.prompt_store
     }
 

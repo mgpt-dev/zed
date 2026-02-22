@@ -1,3 +1,4 @@
+use crate::InlineAssist;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use db::kvp::KEY_VALUE_STORE;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use settings::SoftWrap;
 use std::sync::Arc;
 use ui::prelude::*;
-use ui::{ListItem, Tooltip};
+use ui::{ContextMenu, ListItem, Tooltip};
 use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     Workspace,
@@ -220,6 +221,12 @@ impl PlanningPanel {
         })
     }
 
+    /// Returns a reference to the markdown editor used for plan content.
+    /// This is used by the InlineAssist action to provide AI assistance.
+    pub fn markdown_editor(&self) -> &Entity<Editor> {
+        &self.markdown_editor
+    }
+
     /// Creates a new planning panel and returns an Entity wrapper.
     /// This is the factory function used by workspace.update_in() in tests.
     fn new_panel(
@@ -240,6 +247,23 @@ impl PlanningPanel {
         markdown_editor.update(cx, |editor, cx| {
             editor.set_placeholder_text("Start planning...", window, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+
+            // Set up custom context menu with Inline Assist option
+            editor.set_custom_context_menu(|editor, _point, window, cx| {
+                let has_selection = editor.has_non_empty_selection(&editor.display_snapshot(cx));
+
+                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.action("Cut", Box::new(editor::actions::Cut))
+                        .action_disabled_when(
+                            !has_selection,
+                            "Copy",
+                            Box::new(editor::actions::Copy),
+                        )
+                        .action("Paste", Box::new(editor::actions::Paste))
+                        .separator()
+                        .action("Inline Assist", Box::new(InlineAssist::default()))
+                }))
+            });
         });
 
         // Create editor for plan input description (no line numbers, minimal UI)
