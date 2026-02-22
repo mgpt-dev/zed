@@ -1,7 +1,5 @@
 mod actions;
 mod planning_panel;
-#[cfg(test)]
-mod planning_panel_tests;
 
 pub use actions::*;
 pub use planning_panel::PlanningPanel;

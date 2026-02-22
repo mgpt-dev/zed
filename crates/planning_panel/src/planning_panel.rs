@@ -220,6 +220,16 @@ impl PlanningPanel {
         })
     }
 
+    /// Creates a new planning panel and returns an Entity wrapper.
+    /// This is the factory function used by workspace.update_in() in tests.
+    fn new_panel(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        cx.new(|cx| Self::new(workspace, window, cx))
+    }
+
     pub fn new(
         workspace: &Workspace,
         window: &mut Window,
@@ -256,11 +266,12 @@ impl PlanningPanel {
         let editor_subscription = cx.subscribe_in(
             &markdown_editor,
             window,
-            |panel, _, event, _window, cx| {
+            |panel, _, event, window, cx| {
                 if let EditorEvent::BufferEdited { .. } = event {
-                    panel.sync_editor_to_plan(cx);
-                    // Only mark as dirty if not suppressed (i.e., user is editing, not programmatic)
+                    // Skip sync during programmatic updates to avoid cascading sync issues
+                    // (e.g., trimmed title from parser overwriting user's trailing space)
                     if !panel.suppress_dirty {
+                        panel.sync_editor_to_plan(window, cx);
                         panel.plan_dirty = true;
                     }
                 }
@@ -285,8 +296,9 @@ impl PlanningPanel {
             window,
             |panel, _, event, window, cx| {
                 if let EditorEvent::BufferEdited { .. } = event {
-                    panel.sync_title_to_plan(window, cx);
+                    // Skip sync during programmatic updates to avoid cascading sync issues
                     if !panel.suppress_dirty {
+                        panel.sync_title_to_plan(window, cx);
                         panel.plan_dirty = true;
                     }
                 }
@@ -323,7 +335,7 @@ impl PlanningPanel {
     }
 
     /// Sync markdown editor content to plan state
-    fn sync_editor_to_plan(&mut self, cx: &mut Context<Self>) {
+    fn sync_editor_to_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.markdown_editor.read(cx).text(cx);
         if let Some(mut parsed_plan) = parse_markdown_to_plan(&content) {
             // IMPORTANT: Preserve the existing plan ID to avoid creating duplicates
@@ -333,6 +345,9 @@ impl PlanningPanel {
                 parsed_plan.id = existing_plan.id;
             }
 
+            // Get the new title before updating state
+            let new_title = parsed_plan.metadata.title.clone();
+
             // Update the plan state with parsed content
             let event = PlanEvent::PlanCreated {
                 plan: parsed_plan,
@@ -340,6 +355,20 @@ impl PlanningPanel {
             };
             // Silently update - this is a sync, not a new creation
             let _ = self.state.apply_event(event);
+
+            // Sync the title editor to reflect changes in the frontmatter
+            // Compare trimmed versions to avoid re-syncing when the only difference
+            // is trailing whitespace (which gets trimmed by the YAML parser)
+            self.suppress_dirty = true;
+            self.plan_title_editor.update(cx, |editor, cx| {
+                let current_text = editor.text(cx);
+                // Only update if the trimmed content differs, to allow trailing spaces
+                // while typing and avoid cursor jumping
+                if current_text.trim() != new_title.trim() {
+                    editor.set_text(new_title, window, cx);
+                }
+            });
+            self.suppress_dirty = false;
         }
     }
 
@@ -353,11 +382,12 @@ impl PlanningPanel {
                 editor.set_text(markdown, window, cx);
             });
             // Also sync the title editor
+            // Compare trimmed versions to allow trailing spaces while typing
             self.plan_title_editor.update(cx, |editor, cx| {
                 let current_text = editor.text(cx);
-                // Only update if different to avoid cursor jumping
                 if let Some(plan) = &self.state.current_plan {
-                    if current_text != plan.metadata.title {
+                    // Only update if the trimmed content differs
+                    if current_text.trim() != plan.metadata.title.trim() {
                         editor.set_text(plan.metadata.title.clone(), window, cx);
                     }
                 }
@@ -443,14 +473,14 @@ impl PlanningPanel {
     }
 
     /// Insert text into the markdown editor (used by AI suggestions)
-    pub fn insert_markdown(&mut self, text: &str, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn insert_markdown(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.markdown_editor.update(cx, |editor, cx| {
             // Insert at end of document
             let end = editor.buffer().read(cx).len(cx);
             editor.edit(vec![(end..end, format!("\n{}", text))], cx);
         });
         // Re-sync to plan state
-        self.sync_editor_to_plan(cx);
+        self.sync_editor_to_plan(window, cx);
         cx.notify();
     }
 
@@ -559,23 +589,49 @@ impl PlanningPanel {
         // Build the prompt
         let plan_text = Self::plan_to_prompt_text(plan);
         let prompt = format!(
-            r#"You are a planning assistant. Analyze this plan and suggest improvements.
+            r#"You are a senior software architect performing a comprehensive gap analysis of a development plan. Your goal is to identify issues that could lead to implementation problems, bugs, or project delays.
 
 Current Plan:
 {}
 
-Provide 2-3 specific, actionable suggestions to improve this plan. For each suggestion:
-1. Describe what to improve (one sentence)
-2. Provide the specific content to add or change
+Perform a thorough review and identify issues in the following categories:
+
+1. **Ambiguities in Task Descriptions or Requirements**
+   - Vague or unclear task descriptions
+   - Missing acceptance criteria
+   - Undefined scope boundaries
+
+2. **Missing Edge Cases and Scenarios**
+   - Unhappy paths not considered
+   - Boundary conditions not addressed
+   - User error scenarios missing
+
+3. **Undefined Behaviors or Unclear Outcomes**
+   - Tasks without clear success criteria
+   - Ambiguous expected results
+   - Missing validation steps
+
+4. **Logical Inconsistencies Between Plan Nodes**
+   - Conflicting requirements between tasks
+   - Circular dependencies
+   - Missing prerequisite tasks
+   - Incorrect task ordering
+
+5. **Correctness Risks**
+   - State management issues (race conditions, stale state, inconsistent state)
+   - Concurrency concerns (deadlocks, thread safety, synchronization gaps)
+   - Failure modes and error handling gaps (missing rollback, partial failures, retry logic)
+   - Idempotency violations (operations that aren't safe to retry)
+   - Data integrity risks (validation gaps, constraint violations, data loss scenarios)
+
+Provide 3-5 specific, actionable findings. For each issue:
+1. Describe the problem clearly (one sentence)
+2. Provide specific guidance on how to address it
 
 Format each suggestion on a single line as:
-SUGGESTION: [description] | [content to add/change]
+SUGGESTION: [description of the issue] | [specific guidance to fix or improve]
 
-Focus on:
-- Missing steps or details
-- Unclear or vague items
-- Potential risks or constraints not addressed
-- Dependencies or ordering issues"#,
+Be specific and reference actual items from the plan when possible. Focus on the most critical issues that could derail the implementation."#,
             plan_text
         );
 
@@ -1098,6 +1154,30 @@ Generate a comprehensive plan that the user can immediately start working from."
         }
     }
 
+    /// Save the current plan and close it, returning to the plan list
+    fn save_and_close_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // First save the plan
+        self.save_current_plan(cx);
+
+        // Then close the plan and return to the list
+        // Clear the current plan state
+        if self.state.current_plan.is_some() {
+            let event = PlanEvent::PlanClosed {
+                timestamp: Utc::now(),
+            };
+            let _ = self.state.apply_event(event);
+        }
+
+        self.markdown_editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+        });
+        self.ai_suggestions.clear();
+        self.active_plan_id = None;
+        self.current_view = PlanningPanelView::PlanList;
+        self.serialize(cx);
+        cx.notify();
+    }
+
     /// Load a saved plan by ID
     fn load_saved_plan(&mut self, plan_id: PlanId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(saved_plan) = self.saved_plans.iter().find(|p| p.id == plan_id).cloned() {
@@ -1305,7 +1385,7 @@ impl PlanningPanel {
                         el.child(
                             IconButton::new("ai-suggest", IconName::Sparkle)
                                 .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Get AI Suggestions"))
+                                .tooltip(Tooltip::text("AI Review"))
                                 .disabled(ai_loading)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.request_ai_suggestions(window, cx);
@@ -1322,9 +1402,9 @@ impl PlanningPanel {
                         .child(
                             IconButton::new("save-plan", IconName::Check)
                                 .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Save Plan"))
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.save_current_plan(cx);
+                                .tooltip(Tooltip::text("Save Plan and Exit"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_and_close_plan(window, cx);
                                 }))
                         )
                     })
@@ -1793,3 +1873,668 @@ impl Panel for PlanningPanel {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{px, TestAppContext, VisualTestContext};
+    use project::Project;
+    use settings::SettingsStore;
+    use workspace::MultiWorkspace;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            crate::init(cx);
+        });
+    }
+
+    fn add_planning_panel(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<PlanningPanel> {
+        workspace.update_in(cx, PlanningPanel::new_panel)
+    }
+
+    #[gpui::test]
+    async fn test_planning_panel_creation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify panel was created with default size
+        panel.update_in(cx, |panel, _, _| {
+            assert!(panel.width.is_none(), "Panel should start with no width set");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_planning_panel_resize(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Test resizing the panel
+        workspace.update_in(cx, |workspace, window, cx| {
+            let right_dock = workspace.right_dock();
+            right_dock.update(cx, |dock, cx| {
+                dock.resize_active_panel(Some(px(500.)), window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // Verify the size was updated
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.width,
+                Some(px(500.)),
+                "Panel width should be updated to 500px"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_planning_panel_resize_multiple_times(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Resize multiple times in succession
+        for size in [300., 400., 500., 250.] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                let right_dock = workspace.right_dock();
+                right_dock.update(cx, |dock, cx| {
+                    dock.resize_active_panel(Some(px(size)), window, cx);
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        // Verify final size
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.width,
+                Some(px(250.)),
+                "Panel width should be 250px after multiple resizes"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_planning_panel_reset_size(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Set a size
+        workspace.update_in(cx, |workspace, window, cx| {
+            let right_dock = workspace.right_dock();
+            right_dock.update(cx, |dock, cx| {
+                dock.resize_active_panel(Some(px(600.)), window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Reset to default (None)
+        workspace.update_in(cx, |workspace, window, cx| {
+            let right_dock = workspace.right_dock();
+            right_dock.update(cx, |dock, cx| {
+                dock.resize_active_panel(None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Verify size was reset
+        panel.update_in(cx, |panel, _, _| {
+            assert!(panel.width.is_none(), "Panel width should be reset to None");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plan_id_preserved_on_restore_no_duplicates(cx: &mut TestAppContext) {
+        // Regression test: When restoring a plan after restart, the plan ID must be
+        // preserved. Otherwise, saving the plan creates a duplicate entry because
+        // save_current_plan() can't find the existing entry by ID.
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Step 1: Create a plan and save it
+        let original_plan_id = panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Test Plan".to_string(), window, cx);
+            panel.save_current_plan(cx);
+            panel.state.current_plan.as_ref().unwrap().id
+        });
+
+        cx.run_until_parked();
+
+        // Verify we have exactly 1 saved plan
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(panel.saved_plans.len(), 1, "Should have exactly 1 saved plan");
+            assert_eq!(panel.saved_plans[0].id, original_plan_id, "Plan ID should match");
+        });
+
+        // Step 2: Get the serialized state (simulating what would be saved to disk)
+        let (saved_plans, active_plan_id) = panel.update_in(cx, |panel, _, _| {
+            (panel.saved_plans.clone(), panel.active_plan_id)
+        });
+
+        // Step 3: Simulate restart by clearing the panel state and restoring from serialized data
+        // This mimics what happens in PlanningPanel::load() when Zed restarts
+        panel.update_in(cx, |panel, _, _| {
+            // Clear the current plan (simulating a fresh panel)
+            panel.state = PlanningState::new();
+            panel.saved_plans = Vec::new();
+            panel.active_plan_id = None;
+        });
+
+        cx.run_until_parked();
+
+        // Now restore the saved state (this is what load() does)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.saved_plans = saved_plans;
+            panel.active_plan_id = active_plan_id;
+
+            // Restore the active plan - this is where the bug was fixed
+            // load_saved_plan() now preserves the original plan ID
+            if let Some(plan_id) = panel.active_plan_id {
+                panel.load_saved_plan(plan_id, window, cx);
+            }
+        });
+
+        cx.run_until_parked();
+
+        // Verify the loaded plan has the correct ID (this is the key assertion)
+        panel.update_in(cx, |panel, _, _| {
+            assert!(panel.state.current_plan.is_some(), "Plan should be loaded");
+            assert_eq!(
+                panel.state.current_plan.as_ref().unwrap().id,
+                original_plan_id,
+                "Loaded plan should have the original ID (not a new ID)"
+            );
+        });
+
+        // Step 4: Save the plan again - this would create a duplicate if ID wasn't preserved
+        panel.update_in(cx, |panel, _, cx| {
+            panel.save_current_plan(cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify we still have exactly 1 saved plan (no duplicate created)
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.saved_plans.len(),
+                1,
+                "Should still have exactly 1 saved plan after re-save (no duplicate)"
+            );
+            assert_eq!(
+                panel.saved_plans[0].id, original_plan_id,
+                "The saved plan should have the original ID"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_title_editor_syncs_to_markdown_editor(cx: &mut TestAppContext) {
+        // Test: When editing the Plan Title Editor, changes should immediately
+        // sync to the Markdown Editor's frontmatter (title: field)
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create a plan with an initial title
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Initial Title".to_string(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify initial state
+        panel.update_in(cx, |panel, _, cx| {
+            let title_text = panel.plan_title_editor.read(cx).text(cx);
+            assert_eq!(title_text, "Initial Title", "Title editor should have initial title");
+
+            let markdown_text = panel.markdown_editor.read(cx).text(cx);
+            assert!(
+                markdown_text.contains("title: Initial Title"),
+                "Markdown should contain title in frontmatter"
+            );
+        });
+
+        // Update the title via the plan title editor
+        panel.update_in(cx, |panel, window, cx| {
+            panel.plan_title_editor.update(cx, |editor, cx| {
+                editor.set_text("Updated Title From Title Editor", window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // Verify the markdown editor was updated with the new title
+        panel.update_in(cx, |panel, _, cx| {
+            let markdown_text = panel.markdown_editor.read(cx).text(cx);
+            assert!(
+                markdown_text.contains("title: Updated Title From Title Editor"),
+                "Markdown frontmatter should be updated when title editor changes. Got: {}",
+                markdown_text
+            );
+
+            // Also verify the plan state was updated
+            assert_eq!(
+                panel.state.current_plan.as_ref().unwrap().metadata.title,
+                "Updated Title From Title Editor",
+                "Plan state should have updated title"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_markdown_editor_syncs_to_title_editor(cx: &mut TestAppContext) {
+        // Test: When editing the Markdown Editor's frontmatter (title: field),
+        // changes should immediately sync to the Plan Title Editor
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create a plan with an initial title
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Initial Title".to_string(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify initial state
+        panel.update_in(cx, |panel, _, cx| {
+            let title_text = panel.plan_title_editor.read(cx).text(cx);
+            assert_eq!(title_text, "Initial Title", "Title editor should have initial title");
+        });
+
+        // Update the title via the markdown editor by changing the frontmatter
+        panel.update_in(cx, |panel, window, cx| {
+            panel.markdown_editor.update(cx, |editor, cx| {
+                // Replace the entire content with new frontmatter
+                let new_content = "---\ntitle: Updated Title From Markdown\ndescription: \n---\n\n";
+                editor.set_text(new_content, window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // Verify the title editor was updated with the new title
+        panel.update_in(cx, |panel, _, cx| {
+            let title_text = panel.plan_title_editor.read(cx).text(cx);
+            assert_eq!(
+                title_text, "Updated Title From Markdown",
+                "Title editor should be updated when markdown frontmatter changes"
+            );
+
+            // Also verify the plan state was updated
+            assert_eq!(
+                panel.state.current_plan.as_ref().unwrap().metadata.title,
+                "Updated Title From Markdown",
+                "Plan state should have updated title"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_and_close_plan_saves_and_returns_to_plan_list(cx: &mut TestAppContext) {
+        // Test: save_and_close_plan should save the current plan and return to PlanList view
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create a plan and switch to PlanEditor view
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Test Plan for Save and Close".to_string(), window, cx);
+            // Simulate being in PlanEditor view (as would happen in normal UI flow)
+            panel.current_view = PlanningPanelView::PlanEditor;
+        });
+
+        cx.run_until_parked();
+
+        // Verify we're in PlanEditor view and no saved plans yet
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.current_view,
+                PlanningPanelView::PlanEditor,
+                "Should be in PlanEditor view"
+            );
+            assert_eq!(
+                panel.saved_plans.len(),
+                0,
+                "Should have no saved plans initially"
+            );
+        });
+
+        // Call save_and_close_plan
+        panel.update_in(cx, |panel, window, cx| {
+            panel.save_and_close_plan(window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify we returned to PlanList view and plan was saved
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.current_view,
+                PlanningPanelView::PlanList,
+                "Should return to PlanList view after save_and_close_plan"
+            );
+            assert_eq!(
+                panel.saved_plans.len(),
+                1,
+                "Should have exactly 1 saved plan after save_and_close_plan"
+            );
+            assert_eq!(
+                panel.saved_plans[0].name,
+                "Test Plan for Save and Close",
+                "Saved plan should have correct name"
+            );
+            assert!(
+                panel.state.current_plan.is_none(),
+                "Current plan should be None after closing"
+            );
+            assert!(
+                panel.active_plan_id.is_none(),
+                "Active plan ID should be None after closing"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_and_close_plan_updates_existing_plan(cx: &mut TestAppContext) {
+        // Test: save_and_close_plan on an existing plan should update it, not create a duplicate
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create and save a plan first
+        let original_plan_id = panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Original Plan Name".to_string(), window, cx);
+            panel.save_current_plan(cx);
+            panel.state.current_plan.as_ref().unwrap().id
+        });
+
+        cx.run_until_parked();
+
+        // Verify we have 1 saved plan
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(panel.saved_plans.len(), 1, "Should have 1 saved plan");
+        });
+
+        // Modify the title and use save_and_close_plan
+        panel.update_in(cx, |panel, window, cx| {
+            panel.plan_title_editor.update(cx, |editor, cx| {
+                editor.set_text("Updated Plan Name", window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.save_and_close_plan(window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify we still have only 1 saved plan (updated, not duplicated)
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.current_view,
+                PlanningPanelView::PlanList,
+                "Should return to PlanList view"
+            );
+            assert_eq!(
+                panel.saved_plans.len(),
+                1,
+                "Should still have exactly 1 saved plan (no duplicate)"
+            );
+            assert_eq!(
+                panel.saved_plans[0].id, original_plan_id,
+                "Plan should have the same ID"
+            );
+            assert_eq!(
+                panel.saved_plans[0].name, "Updated Plan Name",
+                "Plan name should be updated"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_and_close_clears_ai_suggestions(cx: &mut TestAppContext) {
+        // Test: save_and_close_plan should clear AI suggestions
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create a plan
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Test Plan".to_string(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Manually add some AI suggestions to simulate having received them
+        panel.update_in(cx, |panel, _, _| {
+            panel.ai_suggestions.push(AiSuggestion {
+                id: 1,
+                description: "Test suggestion".to_string(),
+                target_node: None,
+                suggestion_type: AiSuggestionType::Critique,
+                content: "Test content".to_string(),
+            });
+            assert_eq!(
+                panel.ai_suggestions.len(),
+                1,
+                "Should have 1 AI suggestion"
+            );
+        });
+
+        // Call save_and_close_plan
+        panel.update_in(cx, |panel, window, cx| {
+            panel.save_and_close_plan(window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify AI suggestions were cleared
+        panel.update_in(cx, |panel, _, _| {
+            assert_eq!(
+                panel.ai_suggestions.len(),
+                0,
+                "AI suggestions should be cleared after save_and_close_plan"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_save_and_close_clears_markdown_editor(cx: &mut TestAppContext) {
+        // Test: save_and_close_plan should clear the markdown editor
+        init_test(cx);
+
+        let project = Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let panel = add_planning_panel(&workspace, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Create a plan with content
+        panel.update_in(cx, |panel, window, cx| {
+            panel.create_empty_plan("Test Plan".to_string(), window, cx);
+            // Add some content to the markdown editor
+            panel.markdown_editor.update(cx, |editor, cx| {
+                editor.set_text("---\ntitle: Test Plan\n---\n\n## Goal: Test Goal\n- [ ] Task 1", window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // Verify editor has content
+        panel.update_in(cx, |panel, _, cx| {
+            let content = panel.markdown_editor.read(cx).text(cx);
+            assert!(!content.is_empty(), "Markdown editor should have content");
+        });
+
+        // Call save_and_close_plan
+        panel.update_in(cx, |panel, window, cx| {
+            panel.save_and_close_plan(window, cx);
+        });
+
+        cx.run_until_parked();
+
+        // Verify markdown editor was cleared
+        panel.update_in(cx, |panel, _, cx| {
+            let content = panel.markdown_editor.read(cx).text(cx);
+            assert!(
+                content.is_empty(),
+                "Markdown editor should be cleared after save_and_close_plan"
+            );
+        });
+    }
+}

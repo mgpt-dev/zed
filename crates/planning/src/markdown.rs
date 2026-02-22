@@ -36,7 +36,9 @@ fn parse_frontmatter<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'
     loop {
         let line = lines.next()?;
         if line.trim() == "---" { break; }
-        if let Some(v) = line.trim().strip_prefix("name:") { name = v.trim().to_string(); }
+        // Accept both "title:" and "name:" for the plan title (title takes precedence)
+        if let Some(v) = line.trim().strip_prefix("title:") { name = v.trim().to_string(); }
+        else if let Some(v) = line.trim().strip_prefix("name:") { if name.is_empty() { name = v.trim().to_string(); } }
         else if let Some(v) = line.trim().strip_prefix("description:") { description = v.trim().to_string(); }
     }
 
@@ -89,7 +91,7 @@ fn add_item(root: &mut PlanNode, parent_id: Option<NodeId>, nt: NodeType, conten
 pub fn render_plan_to_markdown(plan: &Plan) -> String {
     let mut out = String::new();
     out.push_str("---\n");
-    out.push_str(&format!("name: {}\n", plan.metadata.title));
+    out.push_str(&format!("title: {}\n", plan.metadata.title));
     if !plan.metadata.description.is_empty() {
         out.push_str(&format!("description: {}\n", plan.metadata.description));
     }
@@ -144,8 +146,23 @@ mod tests {
         let c = "---\nname: Test\n---\n\n## Goal: Main\n\n- [ ] Task\n\n";
         let plan = parse_markdown_to_plan(c).unwrap();
         let r = render_plan_to_markdown(&plan);
-        assert!(r.contains("name: Test"));
+        assert!(r.contains("title: Test"));
         assert!(r.contains("## Goal: Main"));
+    }
+
+    #[test]
+    fn test_parse_title_frontmatter() {
+        let c = "---\ntitle: Test Plan\ndescription: A test\n---\n\n## Goal: Do it\n";
+        let plan = parse_markdown_to_plan(c).unwrap();
+        assert_eq!(plan.metadata.title, "Test Plan");
+        assert_eq!(plan.metadata.description, "A test");
+    }
+
+    #[test]
+    fn test_title_takes_precedence_over_name() {
+        let c = "---\nname: Old Name\ntitle: New Title\ndescription: A test\n---\n\n## Goal: Do it\n";
+        let plan = parse_markdown_to_plan(c).unwrap();
+        assert_eq!(plan.metadata.title, "New Title");
     }
 
     #[test]
