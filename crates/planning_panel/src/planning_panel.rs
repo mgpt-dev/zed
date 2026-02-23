@@ -1,26 +1,35 @@
 use crate::InlineAssist;
+use agent::PlanningTools;
+use agent_ui::inline_assistant::InlineAssistant;
+use agent_ui::language_model_selector::{LanguageModelSelector, language_model_selector};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use db::kvp::KEY_VALUE_STORE;
 use editor::{CurrentLineHighlight, Editor, EditorEvent};
+use fs::Fs;
 use futures::StreamExt;
 use gpui::{
     App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    Focusable, FocusHandle, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
+    Focusable, FocusHandle, Render, SharedString, Subscription, Task, UpdateGlobal, WeakEntity,
+    Window, px,
 };
 use language_model::{
-    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage, Role,
+    IconOrSvg, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
+    Role, StopReason,
 };
+use picker::popover_menu::PickerPopoverMenu;
 use planning::{
     Plan, PlanEvent, PlanId, PlanMetadata, PlanNode, PlanVersion, PlanningState, NodeId, NodeType,
     TemplateRegistry, derive_tasks_from_plan, tasks_to_markdown,
     parse_markdown_to_plan, render_plan_to_markdown,
 };
+use project::Project;
 use serde::{Deserialize, Serialize};
-use settings::SoftWrap;
+use settings::{LanguageModelProviderSetting, LanguageModelSelection, SoftWrap, update_settings_file};
 use std::sync::Arc;
 use ui::prelude::*;
-use ui::{ContextMenu, ListItem, Tooltip};
+use ui::{ButtonLike, ContextMenu, ListItem, PopoverMenuHandle, TintColor, Tooltip};
 use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     Workspace,
@@ -95,6 +104,8 @@ pub struct PlanningPanel {
     state: PlanningState,
     template_registry: Arc<TemplateRegistry>,
     width: Option<Pixels>,
+    /// Filesystem access for settings updates
+    fs: Arc<dyn Fs>,
     /// Current view state
     current_view: PlanningPanelView,
     /// List of saved plans
@@ -135,6 +146,10 @@ pub struct PlanningPanel {
     plan_dirty: bool,
     /// Whether to suppress dirty marking (during programmatic editor updates)
     suppress_dirty: bool,
+    /// Language model selector for choosing which AI model to use
+    language_model_selector: Entity<LanguageModelSelector>,
+    /// Handle for the language model selector popover menu
+    language_model_selector_menu_handle: PopoverMenuHandle<LanguageModelSelector>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -329,12 +344,55 @@ impl PlanningPanel {
             },
         );
 
+        // Get fs from workspace for settings updates
+        let fs = workspace.app_state().fs.clone();
+        let focus_handle = cx.focus_handle();
+
+        // Create language model selector
+        let fs_for_model_change = fs.clone();
+        let fs_for_toggle_favorite = fs.clone();
+        let focus_handle_for_selector = focus_handle.clone();
+        let language_model_selector = cx.new(|cx| {
+            language_model_selector(
+                |cx| LanguageModelRegistry::read_global(cx).default_model(),
+                move |model, cx| {
+                    update_settings_file(fs_for_model_change.clone(), cx, move |settings, _| {
+                        let provider = model.provider_id().0.to_string();
+                        let model_id = model.id().0.to_string();
+                        settings.agent.get_or_insert_default().set_model(
+                            LanguageModelSelection {
+                                provider: LanguageModelProviderSetting(provider),
+                                model: model_id,
+                                enable_thinking: model.supports_thinking(),
+                                effort: model
+                                    .default_effort_level()
+                                    .map(|effort| effort.value.to_string()),
+                            },
+                        );
+                    });
+                },
+                move |model, should_be_favorite, cx| {
+                    agent_ui::favorite_models::toggle_in_settings(
+                        model,
+                        should_be_favorite,
+                        fs_for_toggle_favorite.clone(),
+                        cx,
+                    );
+                },
+                true, // Use popover styles for picker
+                focus_handle_for_selector,
+                window,
+                cx,
+            )
+        });
+
         Self {
             workspace: workspace.weak_handle(),
             focus_handle: cx.focus_handle(),
             state: PlanningState::new(),
             template_registry: Arc::new(TemplateRegistry::new()),
             width: None,
+            fs,
             current_view: PlanningPanelView::PlanList,
             saved_plans: Vec::new(),
             active_plan_id: None,
@@ -355,6 +413,8 @@ impl PlanningPanel {
             _ai_task: None,
             plan_dirty: false,
             suppress_dirty: false,
+            language_model_selector,
+            language_model_selector_menu_handle: PopoverMenuHandle::default(),
         }
     }
 
@@ -659,6 +719,8 @@ Be specific and reference actual items from the plan when possible. Focus on the
             plan_text
         );
 
+        log::info!("[PlanningPanel] Gap analysis prompt:\n{}", prompt);
+
         let request = LanguageModelRequest {
             thread_id: None,
             prompt_id: None,
@@ -680,6 +742,7 @@ Be specific and reference actual items from the plan when possible. Focus on the
         // Stream the completion - use deref to get AsyncApp reference
         let async_app: &gpui::AsyncApp = &*cx;
         let stream_result = model.stream_completion_text(request, async_app).await?;
+        log::info!("[PlanningPanel] Gap analysis response received");
         let mut stream = stream_result.stream;
         let mut response = String::new();
 
@@ -781,6 +844,13 @@ Be specific and reference actual items from the plan when possible. Focus on the
             return;
         }
 
+        // Get the project from workspace for tool access
+        let project = self.workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let project = match project {
+            Ok(project) => Some(project),
+            Err(_) => None,
+        };
+
         self.plan_input_description = description.clone();
         self.inferring_templates = true;
         self.template_inference_result = None;
@@ -810,7 +880,7 @@ Be specific and reference actual items from the plan when possible. Focus on the
             };
 
             // Phase 4: Generate the full plan
-            let plan_result = Self::generate_plan_async(&description, &inference, cx).await;
+            let plan_result = Self::generate_plan_async(&description, &inference, project, cx).await;
 
             // Final update_in call with all state changes
             let _ = panel.update_in(cx, |panel, window, cx| {
@@ -930,6 +1000,8 @@ Only select templates that are in the available list above."#,
             description
         );
 
+        log::info!("[PlanningPanel] Template inference prompt:\n{}", prompt);
+
         let request = LanguageModelRequest {
             thread_id: None,
             prompt_id: None,
@@ -950,6 +1022,7 @@ Only select templates that are in the available list above."#,
 
         let async_app: &gpui::AsyncApp = &*cx;
         let stream_result = model.stream_completion_text(request, async_app).await?;
+        log::info!("[PlanningPanel] Template inference response received");
         let mut stream = stream_result.stream;
         let mut response = String::new();
 
@@ -992,10 +1065,12 @@ Only select templates that are in the available list above."#,
         })
     }
 
-    /// Generate a full plan markdown from user description and selected templates
+    /// Generate a full plan markdown from user description and selected templates.
+    /// If a project is provided, the AI can use tools to explore the codebase.
     async fn generate_plan_async(
         description: &str,
         inference: &TemplateInferenceResult,
+        project: Option<Entity<Project>>,
         cx: &mut AsyncWindowContext,
     ) -> Result<String> {
         let configured_model = cx.update(|_window, cx| {
@@ -1026,6 +1101,25 @@ Only select templates that are in the available list above."#,
 
         let model = configured_model.model;
 
+        // Create planning tools if project is available
+        let (planning_tools, tools, tool_instructions) = if let Some(ref project) = project {
+            let tools_instance = cx.update(|_window, _cx| PlanningTools::new(project.clone()))?;
+            let tool_defs = tools_instance.definitions();
+            let instructions = r#"
+
+You have access to tools to explore the codebase before creating the plan:
+- `grep`: Search for patterns in files (use regex)
+- `find_path`: Find files by glob pattern
+- `list_directory`: List contents of a directory
+- `read_file`: Read file contents (for large files, returns an outline with line numbers - use start_line/end_line to read specific sections)
+
+Use these tools to understand the existing code structure and make your plan more specific and actionable.
+After gathering sufficient context, generate the final plan."#;
+            (Some(tools_instance), tool_defs, instructions)
+        } else {
+            (None, Vec::new(), "")
+        };
+
         let templates_str = inference.templates.join(", ");
         let prompt = format!(
             r#"You are a planning assistant. Create a detailed, actionable plan based on the user's request.
@@ -1033,7 +1127,7 @@ Only select templates that are in the available list above."#,
 User's request:
 {}
 
-Selected templates: {}
+Selected templates: {}{}
 
 Generate a plan in markdown format with YAML frontmatter. The plan should:
 1. Have a clear, descriptive title
@@ -1062,53 +1156,154 @@ description: [Brief description]
 Include relevant details, acceptance criteria, and notes where appropriate.
 Generate a comprehensive plan that the user can immediately start working from."#,
             description,
-            templates_str
+            templates_str,
+            tool_instructions
         );
 
-        let request = LanguageModelRequest {
-            thread_id: None,
-            prompt_id: None,
-            intent: None,
-            messages: vec![LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![language_model::MessageContent::Text(prompt)],
+        log::info!("[PlanningPanel] Plan generation prompt:\n{}", prompt);
+
+        // Build the initial request
+        let mut messages = vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text(prompt)],
+            cache: false,
+            reasoning_details: None,
+        }];
+
+        // Agentic loop: continue until model stops without tool use
+        const MAX_TOOL_ITERATIONS: usize = 50;
+        let mut iteration = 0;
+
+        loop {
+            iteration += 1;
+            if iteration > MAX_TOOL_ITERATIONS {
+                log::warn!("[PlanningPanel] Max tool iterations reached, forcing completion");
+                break;
+            }
+
+            let request = LanguageModelRequest {
+                thread_id: None,
+                prompt_id: None,
+                intent: None,
+                messages: messages.clone(),
+                tools: tools.clone(),
+                tool_choice: None,
+                stop: Vec::new(),
+                temperature: None,
+                thinking_allowed: false,
+                thinking_effort: None,
+            };
+
+            let async_app: &gpui::AsyncApp = &*cx;
+            let stream = model.stream_completion(request, async_app).await?;
+            let mut stream = std::pin::pin!(stream);
+
+            let mut response_text = String::new();
+            let mut tool_uses: Vec<LanguageModelToolUse> = Vec::new();
+            let mut stop_reason = None;
+
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(LanguageModelCompletionEvent::Text(text)) => {
+                        response_text.push_str(&text);
+                    }
+                    Ok(LanguageModelCompletionEvent::ToolUse(tool_use)) => {
+                        if tool_use.is_input_complete {
+                            log::info!("[PlanningPanel] Tool use: {}", tool_use.name);
+                            tool_uses.push(tool_use);
+                        }
+                    }
+                    Ok(LanguageModelCompletionEvent::Stop(reason)) => {
+                        stop_reason = Some(reason);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("[PlanningPanel] Error in stream: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            // If no tools were used, we're done
+            if tool_uses.is_empty() || planning_tools.is_none() {
+                // Clean up the response
+                let markdown = response_text
+                    .trim()
+                    .trim_start_matches("```yaml")
+                    .trim_start_matches("```markdown")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+                    .to_string();
+                return Ok(markdown);
+            }
+
+            // Add assistant message with tool uses
+            let mut assistant_content: Vec<MessageContent> = Vec::new();
+            if !response_text.is_empty() {
+                assistant_content.push(MessageContent::Text(response_text));
+            }
+            for tool_use in &tool_uses {
+                assistant_content.push(MessageContent::ToolUse(tool_use.clone()));
+            }
+            messages.push(LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: assistant_content,
                 cache: false,
                 reasoning_details: None,
-            }],
-            tools: Vec::new(),
-            tool_choice: None,
-            stop: Vec::new(),
-            temperature: None, // Let model use default (some models like o1/o3 don't support temperature)
-            thinking_allowed: false,
-            thinking_effort: None,
-        };
+            });
 
-        let async_app: &gpui::AsyncApp = &*cx;
-        let stream_result = model.stream_completion_text(request, async_app).await?;
-        let mut stream = stream_result.stream;
-        let mut response = String::new();
+            // Execute tools and collect results
+            let planning_tools_ref = planning_tools.as_ref().unwrap();
+            let mut tool_results: Vec<LanguageModelToolResult> = Vec::new();
 
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(text) => response.push_str(&text),
-                Err(e) => {
-                    log::warn!("Error in AI stream: {:?}", e);
-                    break;
+            for tool_use in &tool_uses {
+                let result = cx.update(|_window, cx| {
+                    planning_tools_ref.run_tool(tool_use, None, cx)
+                })?;
+
+                if let Some(task) = result {
+                    let tool_result = task.await;
+                    log::info!(
+                        "[PlanningPanel] Tool {} result: error={}",
+                        tool_result.tool_name,
+                        tool_result.is_error
+                    );
+                    tool_results.push(tool_result);
+                } else {
+                    // Tool not found, return error result
+                    tool_results.push(LanguageModelToolResult {
+                        tool_use_id: tool_use.id.clone(),
+                        tool_name: tool_use.name.clone(),
+                        is_error: true,
+                        content: language_model::LanguageModelToolResultContent::Text(
+                            format!("Tool '{}' not found", tool_use.name).into(),
+                        ),
+                        output: None,
+                    });
                 }
+            }
+
+            // Add tool results as user message
+            let tool_result_content: Vec<MessageContent> = tool_results
+                .into_iter()
+                .map(MessageContent::ToolResult)
+                .collect();
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: tool_result_content,
+                cache: false,
+                reasoning_details: None,
+            });
+
+            // Check if we should continue
+            if stop_reason == Some(StopReason::EndTurn) {
+                break;
             }
         }
 
-        // Clean up the response - remove markdown code blocks if present
-        let markdown = response
-            .trim()
-            .trim_start_matches("```yaml")
-            .trim_start_matches("```markdown")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim()
-            .to_string();
-
-        Ok(markdown)
+        // If we got here via max iterations, try to extract any response we have
+        Err(anyhow::anyhow!("Plan generation did not complete successfully"))
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
@@ -1182,6 +1377,11 @@ Generate a comprehensive plan that the user can immediately start working from."
     fn save_and_close_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // First save the plan
         self.save_current_plan(cx);
+
+        // Dismiss any active inline assists on the markdown editor
+        InlineAssistant::update_global(cx, |assistant, cx| {
+            assistant.dismiss_assists_for_editor(&self.markdown_editor, window, cx);
+        });
 
         // Then close the plan and return to the list
         // Clear the current plan state
@@ -1271,6 +1471,11 @@ Generate a comprehensive plan that the user can immediately start working from."
             self.save_current_plan(cx);
         }
 
+        // Dismiss any active inline assists on the markdown editor
+        InlineAssistant::update_global(cx, |assistant, cx| {
+            assistant.dismiss_assists_for_editor(&self.markdown_editor, window, cx);
+        });
+
         // Clear the current plan state
         if self.state.current_plan.is_some() {
             let event = PlanEvent::PlanClosed {
@@ -1300,9 +1505,22 @@ impl Focusable for PlanningPanel {
 }
 
 impl Render for PlanningPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_view = self.current_view.clone();
         let has_suggestions = !self.ai_suggestions.is_empty();
+
+        // Render content based on current view - convert to AnyElement to avoid lifetime issues
+        let content: gpui::AnyElement = match current_view {
+            PlanningPanelView::PlanList => self.render_plan_list(cx).into_any_element(),
+            PlanningPanelView::NewPlanDialog => {
+                self.render_new_plan_dialog(window, cx).into_any_element()
+            }
+            PlanningPanelView::PlanEditor => v_flex()
+                .size_full()
+                .child(self.render_plan_title_editor(cx))
+                .child(self.markdown_editor.clone())
+                .into_any_element(),
+        };
 
         v_flex()
             .id("planning-panel")
@@ -1319,22 +1537,7 @@ impl Render for PlanningPanel {
                     .id("planning-panel-content")
                     .flex_1()
                     .overflow_y_scroll()
-                    .map(|el| match current_view {
-                        PlanningPanelView::PlanList => {
-                            el.child(self.render_plan_list(cx))
-                        }
-                        PlanningPanelView::NewPlanDialog => {
-                            el.child(self.render_new_plan_dialog(cx))
-                        }
-                        PlanningPanelView::PlanEditor => {
-                            el.child(
-                                v_flex()
-                                    .size_full()
-                                    .child(self.render_plan_title_editor(cx))
-                                    .child(self.markdown_editor.clone())
-                            )
-                        }
-                    })
+                    .child(content)
             )
             // AI Suggestions section at the bottom (only in editor view)
             .when(has_suggestions && current_view == PlanningPanelView::PlanEditor, |el| {
@@ -1560,8 +1763,74 @@ impl PlanningPanel {
             })
     }
 
+    /// Render the language model selector button and popover menu
+    fn render_language_model_selector(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active_model = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.model);
+        let model_name = match active_model {
+            Some(ref model) => model.name().0.clone(),
+            None => SharedString::from("Select Model"),
+        };
+
+        let active_provider = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.provider);
+
+        let provider_icon = active_provider
+            .as_ref()
+            .map(|p| p.icon())
+            .unwrap_or(IconOrSvg::Icon(IconName::Ai));
+
+        let (color, icon) = if self.language_model_selector_menu_handle.is_deployed() {
+            (Color::Accent, IconName::ChevronUp)
+        } else {
+            (Color::Muted, IconName::ChevronDown)
+        };
+
+        let provider_icon_element = match provider_icon {
+            IconOrSvg::Svg(path) => Icon::from_external_svg(path),
+            IconOrSvg::Icon(name) => Icon::new(name),
+        }
+        .color(color)
+        .size(IconSize::XSmall);
+
+        let tooltip = Tooltip::text("Select AI Model");
+
+        PickerPopoverMenu::new(
+            self.language_model_selector.clone(),
+            ButtonLike::new("active-model")
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(provider_icon_element)
+                        .child(
+                            Label::new(model_name)
+                                .color(color)
+                                .size(LabelSize::Small)
+                                .ml_0p5(),
+                        )
+                        .child(Icon::new(icon).color(color).size(IconSize::XSmall)),
+                ),
+            tooltip,
+            gpui::Corner::BottomRight,
+            cx,
+        )
+        .with_handle(self.language_model_selector_menu_handle.clone())
+        .render(window, cx)
+    }
+
     /// Render the new plan dialog (Phase 2)
-    fn render_new_plan_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_plan_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let _has_inference_result = self.template_inference_result.is_some();
         let is_loading = self.inferring_templates || self.generating_plan;
         let input_is_empty = self.plan_input_description.trim().is_empty();
@@ -1605,14 +1874,7 @@ impl PlanningPanel {
                         h_flex()
                             .justify_end()
                             .gap_2()
-                            .child(
-                                Button::new("cancel-plan", "Cancel")
-                                    .style(ButtonStyle::Subtle)
-                                    .disabled(is_loading)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.show_plan_list(window, cx);
-                                    }))
-                            )
+                            .child(self.render_language_model_selector(window, cx))
                             .child(
                                 Button::new("generate-plan", "Generate Plan")
                                     .icon(IconName::Sparkle)
@@ -1621,6 +1883,14 @@ impl PlanningPanel {
                                     .disabled(input_is_empty || is_loading)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.start_plan_generation(window, cx);
+                                    }))
+                            )
+                            .child(
+                                Button::new("cancel-plan", "Cancel")
+                                    .style(ButtonStyle::Subtle)
+                                    .disabled(is_loading)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_plan_list(window, cx);
                                     }))
                             )
                     )
@@ -1901,7 +2171,9 @@ impl Panel for PlanningPanel {
 mod tests {
     use super::*;
     use gpui::{px, TestAppContext, VisualTestContext};
+    use language_model::LanguageModelRegistry;
     use project::Project;
+    use prompt_store::PromptBuilder;
     use settings::SettingsStore;
     use workspace::MultiWorkspace;
 
@@ -1910,6 +2182,13 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            LanguageModelRegistry::test(cx);
+            prompt_store::init(cx);
+            // Initialize InlineAssistant for tests that use save_and_close_plan
+            let fs = fs::FakeFs::new(cx.background_executor().clone());
+            let prompt_builder = std::sync::Arc::new(PromptBuilder::new(None).unwrap());
+            agent_ui::inline_assistant::init(fs, prompt_builder, cx);
             crate::init(cx);
         });
     }

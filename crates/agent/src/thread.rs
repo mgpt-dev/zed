@@ -3128,6 +3128,19 @@ impl ToolCallEventStream {
         }
     }
 
+    /// Creates a no-op event stream for running tools without emitting events.
+    /// Useful for headless tool execution (e.g., in the planning panel).
+    pub fn no_op(tool_use_id: impl Into<LanguageModelToolUseId>, fs: Option<Arc<dyn Fs>>) -> Self {
+        let (events_tx, _events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        Self {
+            tool_use_id: tool_use_id.into(),
+            stream: ThreadEventStream(events_tx),
+            fs,
+            cancellation_rx,
+        }
+    }
+
     /// Returns a future that resolves when the user cancels the tool call.
     /// Tools should select on this alongside their main work to detect user cancellation.
     pub fn cancelled_by_user(&self) -> impl std::future::Future<Output = ()> + '_ {

@@ -12441,6 +12441,7 @@ dependencies = [
  "gpui",
  "language_model",
  "log",
+ "picker",
  "planning",
  "project",
  "prompt_store",

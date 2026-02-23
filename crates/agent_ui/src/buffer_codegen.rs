@@ -515,10 +515,15 @@ impl CodegenAlternative {
             };
 
             if let Some(context) = context_task.await {
+                log::info!("[InlineAssist] Adding context to request");
                 context.add_to_request_message(&mut user_message);
             }
 
             user_message.content.push(user_prompt.into());
+
+            log::info!("[InlineAssist] System prompt:\n{}", messages[0].string_contents());
+            log::info!("[InlineAssist] User message:\n{}", user_message.string_contents());
+
             messages.push(user_message);
 
             let tools = vec![
@@ -608,10 +613,13 @@ impl CodegenAlternative {
             };
 
             if let Some(context) = context_task.await {
+                log::info!("[InlineAssist] Adding context to request (non-tools mode)");
                 context.add_to_request_message(&mut request_message);
             }
 
             request_message.content.push(prompt.into());
+
+            log::info!("[InlineAssist] Request message (non-tools mode):\n{}", request_message.string_contents());
 
             LanguageModelRequest {
                 thread_id: None,

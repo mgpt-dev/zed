@@ -942,6 +942,21 @@ impl InlineAssistant {
         }
     }
 
+    /// Dismiss all inline assists associated with the given editor.
+    /// This is useful when navigating away from an editor or closing a panel.
+    pub fn dismiss_assists_for_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(editor_assists) = self.assists_by_editor.get_mut(&editor.downgrade()) {
+            for assist_id in editor_assists.assist_ids.clone() {
+                self.finish_assist(assist_id, true, window, cx);
+            }
+        }
+    }
+
     fn handle_editor_change(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut App) {
         let Some(editor_assists) = self.assists_by_editor.get(&editor.downgrade()) else {
             return;
